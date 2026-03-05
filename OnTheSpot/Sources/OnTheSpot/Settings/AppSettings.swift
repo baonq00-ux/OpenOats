@@ -61,6 +61,11 @@ final class AppSettings {
         set { KeychainHelper.save(key: "openRouterApiKey", value: newValue) }
     }
 
+    var voyageApiKey: String {
+        get { KeychainHelper.load(key: "voyageApiKey") ?? "" }
+        set { KeychainHelper.save(key: "voyageApiKey", value: newValue) }
+    }
+
     var kbFolderURL: URL? {
         guard !kbFolderPath.isEmpty else { return nil }
         return URL(fileURLWithPath: kbFolderPath)

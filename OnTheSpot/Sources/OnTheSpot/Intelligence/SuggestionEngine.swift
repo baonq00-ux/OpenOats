@@ -34,15 +34,18 @@ final class SuggestionEngine {
         let apiKey = settings.openRouterApiKey
         guard !apiKey.isEmpty else { return }
 
-        // Search KB first — skip LLM entirely if nothing relevant
-        let kbResults = knowledgeBase.search(query: utterance.text, topK: 5)
-        guard !kbResults.isEmpty else { return }
-
         isGenerating = true
         currentSuggestion = ""
 
         currentTask = Task {
             do {
+                // Search KB (async — uses Voyage AI embeddings + reranking)
+                let kbResults = await knowledgeBase.search(query: utterance.text, topK: 5)
+                guard !kbResults.isEmpty, !Task.isCancelled else {
+                    isGenerating = false
+                    return
+                }
+
                 let messages = buildMessages(
                     recentUtterances: transcriptStore.recentUtterances,
                     currentQuery: utterance.text,

@@ -23,6 +23,14 @@ struct SettingsView: View {
                 }
             }
 
+            Section("Voyage AI") {
+                SecureField("API Key", text: Binding(
+                    get: { settings.voyageApiKey },
+                    set: { settings.voyageApiKey = $0 }
+                ))
+                .font(.system(size: 12, design: .monospaced))
+            }
+
             Section("OpenRouter API") {
                 SecureField("API Key", text: Binding(
                     get: { settings.openRouterApiKey },

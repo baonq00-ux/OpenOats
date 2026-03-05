@@ -1,27 +1,62 @@
 import Foundation
+import CryptoKit
 
 /// A chunk of text from a knowledge base document.
-struct KBChunk: Sendable {
+struct KBChunk: Codable, Sendable {
     let text: String
     let sourceFile: String
-    let tfidfVector: [String: Double]
+    let headerContext: String
+    let embedding: [Float]
 }
 
-/// TF-IDF based knowledge base search over a folder of .md/.txt files.
+/// Disk cache format for embedded KB chunks.
+private struct KBCache: Codable {
+    /// Keyed by "filename:sha256hash"
+    var entries: [String: [KBChunk]]
+}
+
+/// Embedding-based knowledge base search using Voyage AI.
 @Observable
 @MainActor
 final class KnowledgeBase {
     private(set) var chunks: [KBChunk] = []
     private(set) var isIndexed = false
     private(set) var fileCount = 0
-    private var idf: [String: Double] = [:]
+    private(set) var indexingProgress: String = ""
+
+    private let settings: AppSettings
+    private let voyageClient = VoyageClient()
+
+    private nonisolated static func cacheURL() -> URL {
+        let appSupport = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
+        let dir = appSupport.appendingPathComponent("On The Spot")
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        return dir.appendingPathComponent("kb_cache.json")
+    }
+
+    init(settings: AppSettings) {
+        self.settings = settings
+    }
 
     func index(folderURL: URL) async {
-        // Collect file URLs synchronously to avoid async iterator issues
-        let fileURLs = collectFiles(in: folderURL)
+        let apiKey = settings.voyageApiKey
+        guard !apiKey.isEmpty else {
+            indexingProgress = "No Voyage AI API key"
+            return
+        }
 
+        indexingProgress = "Scanning files..."
+        let fileURLs = collectFiles(in: folderURL)
+        guard !fileURLs.isEmpty else {
+            indexingProgress = ""
+            isIndexed = true
+            return
+        }
+
+        // Load existing cache
+        var cache = loadCache()
         var allChunks: [KBChunk] = []
-        var documentFrequency: [String: Int] = [:]
+        var filesToEmbed: [(key: String, chunks: [(text: String, header: String)])] = []
         var files = 0
 
         for fileURL in fileURLs {
@@ -29,32 +64,151 @@ final class KnowledgeBase {
             files += 1
 
             let fileName = fileURL.lastPathComponent
-            let textChunks = chunkText(content, maxWords: 500)
+            let hash = sha256(content)
+            let cacheKey = "\(fileName):\(hash)"
 
-            for chunk in textChunks {
-                let tf = termFrequency(chunk)
-                allChunks.append(KBChunk(text: chunk, sourceFile: fileName, tfidfVector: tf))
-                let uniqueTerms = Set(tf.keys)
-                for term in uniqueTerms {
-                    documentFrequency[term, default: 0] += 1
+            // Reuse cached embeddings if content hasn't changed
+            if let cached = cache.entries[cacheKey] {
+                allChunks.append(contentsOf: cached)
+                continue
+            }
+
+            let textChunks = chunkMarkdown(content, sourceFile: fileName)
+            filesToEmbed.append((key: cacheKey, chunks: textChunks))
+        }
+
+        // Embed new/changed files in batches
+        if !filesToEmbed.isEmpty {
+            let allTextsToEmbed = filesToEmbed.flatMap { entry in
+                entry.chunks.map { "\($0.header)\n\($0.text)" }
+            }
+
+            indexingProgress = "Embedding \(allTextsToEmbed.count) chunks..."
+
+            let embeddings = await embedInBatches(apiKey: apiKey, texts: allTextsToEmbed)
+
+            if let embeddings {
+                var offset = 0
+                for entry in filesToEmbed {
+                    var fileChunks: [KBChunk] = []
+                    for chunk in entry.chunks {
+                        let embedding = embeddings[offset]
+                        let kbChunk = KBChunk(
+                            text: chunk.text,
+                            sourceFile: entry.key.components(separatedBy: ":").first ?? "",
+                            headerContext: chunk.header,
+                            embedding: embedding
+                        )
+                        fileChunks.append(kbChunk)
+                        offset += 1
+                    }
+                    cache.entries[entry.key] = fileChunks
+                    allChunks.append(contentsOf: fileChunks)
                 }
+
+                // Remove stale cache entries (files that no longer exist)
+                let currentKeys = Set(
+                    fileURLs.compactMap { url -> String? in
+                        guard let content = try? String(contentsOf: url, encoding: .utf8) else { return nil }
+                        return "\(url.lastPathComponent):\(sha256(content))"
+                    }
+                )
+                // Also keep keys for files that were cached and reused
+                let allRelevantKeys = Set(filesToEmbed.map(\.key)).union(
+                    currentKeys
+                )
+                cache.entries = cache.entries.filter { allRelevantKeys.contains($0.key) }
+
+                saveCache(cache)
+            }
+        } else {
+            // All files were cached — still prune stale entries
+            let currentKeys = Set(
+                fileURLs.compactMap { url -> String? in
+                    guard let content = try? String(contentsOf: url, encoding: .utf8) else { return nil }
+                    return "\(url.lastPathComponent):\(sha256(content))"
+                }
+            )
+            if cache.entries.keys.count != currentKeys.count {
+                cache.entries = cache.entries.filter { currentKeys.contains($0.key) }
+                saveCache(cache)
             }
         }
 
-        let n = Double(allChunks.count)
-        var computedIDF: [String: Double] = [:]
-        for (term, df) in documentFrequency {
-            computedIDF[term] = log((1.0 + n) / (1.0 + Double(df))) + 1.0
-        }
-        self.idf = computedIDF
         self.chunks = allChunks
         self.fileCount = files
         self.isIndexed = true
+        self.indexingProgress = ""
     }
 
+    func search(query: String, topK: Int = 5) async -> [KBResult] {
+        let apiKey = settings.voyageApiKey
+        guard isIndexed, !chunks.isEmpty, !apiKey.isEmpty else { return [] }
+
+        // Embed the query
+        let queryEmbedding: [Float]
+        do {
+            let result = try await voyageClient.embed(
+                apiKey: apiKey,
+                texts: [query],
+                inputType: "query"
+            )
+            guard let first = result.first else { return [] }
+            queryEmbedding = first
+        } catch {
+            print("KB search embed error: \(error)")
+            return []
+        }
+
+        // Cosine similarity against all chunks
+        var scored: [(index: Int, score: Float)] = []
+        for (i, chunk) in chunks.enumerated() {
+            let sim = cosineSimilarity(queryEmbedding, chunk.embedding)
+            if sim > 0.1 {
+                scored.append((i, sim))
+            }
+        }
+        scored.sort { $0.score > $1.score }
+        let topCandidates = Array(scored.prefix(10))
+
+        guard !topCandidates.isEmpty else { return [] }
+
+        // Rerank with Voyage
+        let candidateDocs = topCandidates.map { chunks[$0.index].text }
+        do {
+            let reranked = try await voyageClient.rerank(
+                apiKey: apiKey,
+                query: query,
+                documents: candidateDocs,
+                topN: topK
+            )
+            return reranked.map { result in
+                let originalIdx = topCandidates[result.index].index
+                let chunk = chunks[originalIdx]
+                return KBResult(text: chunk.text, sourceFile: chunk.sourceFile, score: result.score)
+            }
+        } catch {
+            // Fallback: return cosine-only results
+            print("KB rerank error (falling back to cosine): \(error)")
+            return topCandidates.prefix(topK).map { candidate in
+                let chunk = chunks[candidate.index]
+                return KBResult(text: chunk.text, sourceFile: chunk.sourceFile, score: Double(candidate.score))
+            }
+        }
+    }
+
+    func clear() {
+        chunks.removeAll()
+        isIndexed = false
+        fileCount = 0
+        indexingProgress = ""
+    }
+
+    // MARK: - File Collection
+
     private nonisolated func collectFiles(in folderURL: URL) -> [URL] {
-        let fileManager = FileManager.default
-        guard let enumerator = fileManager.enumerator(
+        let fm = FileManager.default
+        guard let enumerator = fm.enumerator(
             at: folderURL,
             includingPropertiesForKeys: [.isRegularFileKey],
             options: [.skipsHiddenFiles]
@@ -70,98 +224,213 @@ final class KnowledgeBase {
         return urls
     }
 
-    func search(query: String, topK: Int = 5) -> [KBResult] {
-        guard isIndexed, !chunks.isEmpty else { return [] }
+    // MARK: - Markdown Chunking
 
-        let queryTF = termFrequency(query)
-        let queryVec = tfidfVector(tf: queryTF)
+    /// Splits markdown content into chunks aware of header hierarchy.
+    private nonisolated func chunkMarkdown(_ text: String, sourceFile: String) -> [(text: String, header: String)] {
+        let lines = text.components(separatedBy: .newlines)
 
-        var scored: [(Int, Double)] = []
-        for (i, chunk) in chunks.enumerated() {
-            let chunkVec = tfidfVector(tf: chunk.tfidfVector)
-            let sim = cosineSimilarity(queryVec, chunkVec)
-            if sim > 0.01 {
-                scored.append((i, sim))
+        struct Section {
+            var headers: [String] // hierarchy stack
+            var lines: [String]
+        }
+
+        var sections: [Section] = []
+        var current = Section(headers: [], lines: [])
+
+        for line in lines {
+            if line.hasPrefix("#") {
+                // Flush current section
+                if !current.lines.isEmpty {
+                    sections.append(current)
+                }
+
+                // Parse header level
+                let trimmed = line.drop(while: { $0 == "#" })
+                let level = line.count - trimmed.count
+                let headerText = String(trimmed).trimmingCharacters(in: .whitespaces)
+
+                // Build header stack: keep headers at higher levels, replace at current
+                var newHeaders = current.headers
+                if level <= newHeaders.count {
+                    newHeaders = Array(newHeaders.prefix(level - 1))
+                }
+                newHeaders.append(headerText)
+
+                current = Section(headers: newHeaders, lines: [])
+            } else {
+                current.lines.append(line)
+            }
+        }
+        if !current.lines.isEmpty {
+            sections.append(current)
+        }
+
+        // Merge small sections and split large ones
+        var result: [(text: String, header: String)] = []
+        let targetMin = 80
+        let targetMax = 500
+
+        var pendingText = ""
+        var pendingHeader = ""
+
+        for section in sections {
+            let sectionText = section.lines.joined(separator: "\n").trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !sectionText.isEmpty else { continue }
+
+            let breadcrumb = section.headers.joined(separator: " > ")
+            let wordCount = sectionText.split(separator: " ").count
+
+            if wordCount < targetMin {
+                // Merge with pending
+                if pendingText.isEmpty {
+                    pendingText = sectionText
+                    pendingHeader = breadcrumb
+                } else {
+                    pendingText += "\n\n" + sectionText
+                    // Keep the more specific header
+                    if !breadcrumb.isEmpty { pendingHeader = breadcrumb }
+                }
+
+                // Flush if pending is now large enough
+                let pendingWords = pendingText.split(separator: " ").count
+                if pendingWords >= targetMin {
+                    result.append((text: pendingText, header: pendingHeader))
+                    pendingText = ""
+                    pendingHeader = ""
+                }
+            } else if wordCount > targetMax {
+                // Flush pending first
+                if !pendingText.isEmpty {
+                    result.append((text: pendingText, header: pendingHeader))
+                    pendingText = ""
+                    pendingHeader = ""
+                }
+
+                // Split large section with overlap
+                let words = sectionText.split(separator: " ", omittingEmptySubsequences: true)
+                let overlap = targetMax / 5
+                var start = 0
+                while start < words.count {
+                    let end = min(start + targetMax, words.count)
+                    let chunk = words[start..<end].joined(separator: " ")
+                    result.append((text: chunk, header: breadcrumb))
+                    start += targetMax - overlap
+                }
+            } else {
+                // Flush pending first
+                if !pendingText.isEmpty {
+                    result.append((text: pendingText, header: pendingHeader))
+                    pendingText = ""
+                    pendingHeader = ""
+                }
+                result.append((text: sectionText, header: breadcrumb))
             }
         }
 
-        scored.sort { $0.1 > $1.1 }
-
-        return scored.prefix(topK).map { idx, score in
-            let chunk = chunks[idx]
-            return KBResult(text: chunk.text, sourceFile: chunk.sourceFile, score: score)
+        // Flush remaining
+        if !pendingText.isEmpty {
+            result.append((text: pendingText, header: pendingHeader))
         }
-    }
 
-    func clear() {
-        chunks.removeAll()
-        idf.removeAll()
-        isIndexed = false
-        fileCount = 0
-    }
-
-    // MARK: - Private
-
-    private func chunkText(_ text: String, maxWords: Int) -> [String] {
-        let words = text.split(separator: " ", omittingEmptySubsequences: true)
-        guard words.count > maxWords else { return [text.trimmingCharacters(in: .whitespacesAndNewlines)] }
-
-        var result: [String] = []
-        var start = 0
-        let overlap = maxWords / 5
-
-        while start < words.count {
-            let end = min(start + maxWords, words.count)
-            let chunk = words[start..<end].joined(separator: " ")
-            result.append(chunk)
-            start += maxWords - overlap
+        // If no chunks were produced (e.g. no headers, short doc), chunk the whole text
+        if result.isEmpty && !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            let words = text.split(separator: " ", omittingEmptySubsequences: true)
+            if words.count <= targetMax {
+                result.append((text: text.trimmingCharacters(in: .whitespacesAndNewlines), header: ""))
+            } else {
+                let overlap = targetMax / 5
+                var start = 0
+                while start < words.count {
+                    let end = min(start + targetMax, words.count)
+                    let chunk = words[start..<end].joined(separator: " ")
+                    result.append((text: chunk, header: ""))
+                    start += targetMax - overlap
+                }
+            }
         }
 
         return result
     }
 
-    private func tokenize(_ text: String) -> [String] {
-        text.lowercased()
-            .components(separatedBy: CharacterSet.alphanumerics.inverted)
-            .filter { $0.count > 1 }
+    // MARK: - Embedding Batches
+
+    private func embedInBatches(apiKey: String, texts: [String]) async -> [[Float]]? {
+        let batchSize = 128
+        var allEmbeddings: [[Float]] = []
+
+        for batchStart in stride(from: 0, to: texts.count, by: batchSize) {
+            let batchEnd = min(batchStart + batchSize, texts.count)
+            let batch = Array(texts[batchStart..<batchEnd])
+
+            indexingProgress = "Embedding \(batchStart + 1)-\(batchEnd) of \(texts.count)..."
+
+            var retried = false
+            while true {
+                do {
+                    let embeddings = try await voyageClient.embed(
+                        apiKey: apiKey,
+                        texts: batch,
+                        inputType: "document"
+                    )
+                    allEmbeddings.append(contentsOf: embeddings)
+                    break
+                } catch {
+                    if !retried {
+                        retried = true
+                        print("KB embed batch error (retrying): \(error)")
+                        try? await Task.sleep(for: .seconds(1))
+                        continue
+                    }
+                    print("KB embed batch failed after retry: \(error)")
+                    return nil
+                }
+            }
+        }
+
+        return allEmbeddings
     }
 
-    private func termFrequency(_ text: String) -> [String: Double] {
-        let tokens = tokenize(text)
-        guard !tokens.isEmpty else { return [:] }
-        var freq: [String: Double] = [:]
-        for token in tokens {
-            freq[token, default: 0] += 1.0
+    // MARK: - Vector Math
+
+    private nonisolated func cosineSimilarity(_ a: [Float], _ b: [Float]) -> Float {
+        guard a.count == b.count, !a.isEmpty else { return 0 }
+
+        var dot: Float = 0
+        var magA: Float = 0
+        var magB: Float = 0
+
+        for i in 0..<a.count {
+            dot += a[i] * b[i]
+            magA += a[i] * a[i]
+            magB += b[i] * b[i]
         }
-        let count = Double(tokens.count)
-        for key in freq.keys {
-            freq[key]! /= count
-        }
-        return freq
+
+        let denom = sqrt(magA) * sqrt(magB)
+        guard denom > 0 else { return 0 }
+        return dot / denom
     }
 
-    private func tfidfVector(tf: [String: Double]) -> [String: Double] {
-        var vec: [String: Double] = [:]
-        for (term, tfVal) in tf {
-            let idfVal = idf[term] ?? 1.0
-            vec[term] = tfVal * idfVal
+    // MARK: - Cache
+
+    private nonisolated func loadCache() -> KBCache {
+        guard let data = try? Data(contentsOf: Self.cacheURL()),
+              let cache = try? JSONDecoder().decode(KBCache.self, from: data) else {
+            return KBCache(entries: [:])
         }
-        return vec
+        return cache
     }
 
-    private func cosineSimilarity(_ a: [String: Double], _ b: [String: Double]) -> Double {
-        let allKeys = Set(a.keys).intersection(Set(b.keys))
-        guard !allKeys.isEmpty else { return 0.0 }
+    private nonisolated func saveCache(_ cache: KBCache) {
+        guard let data = try? JSONEncoder().encode(cache) else { return }
+        try? data.write(to: Self.cacheURL(), options: .atomic)
+    }
 
-        var dot = 0.0
-        for key in allKeys {
-            dot += (a[key] ?? 0) * (b[key] ?? 0)
-        }
+    // MARK: - Hashing
 
-        let magA = sqrt(a.values.reduce(0) { $0 + $1 * $1 })
-        let magB = sqrt(b.values.reduce(0) { $0 + $1 * $1 })
-
-        guard magA > 0 && magB > 0 else { return 0.0 }
-        return dot / (magA * magB)
+    private nonisolated func sha256(_ string: String) -> String {
+        let data = Data(string.utf8)
+        let hash = SHA256.hash(data: data)
+        return hash.compactMap { String(format: "%02x", $0) }.joined()
     }
 }

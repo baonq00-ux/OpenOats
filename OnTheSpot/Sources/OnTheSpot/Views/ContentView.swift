@@ -4,7 +4,7 @@ import Combine
 struct ContentView: View {
     @Bindable var settings: AppSettings
     @State private var transcriptStore = TranscriptStore()
-    @State private var knowledgeBase = KnowledgeBase()
+    @State private var knowledgeBase: KnowledgeBase?
     @State private var transcriptionEngine: TranscriptionEngine?
     @State private var suggestionEngine: SuggestionEngine?
     @State private var sessionStore = SessionStore()
@@ -82,15 +82,20 @@ struct ContentView: View {
         .frame(minWidth: 280, maxWidth: 360, minHeight: 400)
         .background(.ultraThinMaterial)
         .onAppear {
+            let kb = KnowledgeBase(settings: settings)
+            knowledgeBase = kb
             transcriptionEngine = TranscriptionEngine(transcriptStore: transcriptStore)
             suggestionEngine = SuggestionEngine(
                 transcriptStore: transcriptStore,
-                knowledgeBase: knowledgeBase,
+                knowledgeBase: kb,
                 settings: settings
             )
             indexKBIfNeeded()
         }
         .onChange(of: settings.kbFolderPath) {
+            indexKBIfNeeded()
+        }
+        .onChange(of: settings.voyageApiKey) {
             indexKBIfNeeded()
         }
         .onChange(of: transcriptStore.utterances.count) {
@@ -119,14 +124,21 @@ struct ContentView: View {
             Spacer()
 
             // KB status
-            if knowledgeBase.isIndexed {
-                HStack(spacing: 4) {
-                    Image(systemName: "folder")
+            if let kb = knowledgeBase {
+                if !kb.indexingProgress.isEmpty {
+                    Text(kb.indexingProgress)
                         .font(.system(size: 10))
-                    Text("\(knowledgeBase.fileCount) files")
-                        .font(.system(size: 11))
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                } else if kb.isIndexed {
+                    HStack(spacing: 4) {
+                        Image(systemName: "folder")
+                            .font(.system(size: 10))
+                        Text("\(kb.fileCount) files")
+                            .font(.system(size: 11))
+                    }
+                    .foregroundStyle(.secondary)
                 }
-                .foregroundStyle(.secondary)
             }
 
             Button("KB Folder...") {
@@ -198,10 +210,10 @@ struct ContentView: View {
     }
 
     private func indexKBIfNeeded() {
-        guard let url = settings.kbFolderURL else { return }
+        guard let url = settings.kbFolderURL, let kb = knowledgeBase else { return }
         Task {
-            knowledgeBase.clear()
-            await knowledgeBase.index(folderURL: url)
+            kb.clear()
+            await kb.index(folderURL: url)
         }
     }
 
