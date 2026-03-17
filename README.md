@@ -1,124 +1,84 @@
 # OpenGranola
 
-OpenGranola is a macOS meeting copilot for live conversations. It listens to your mic and the other side of the call, transcribes both streams in real time, searches your notes, and surfaces grounded talking points while the conversation is happening.
+A meeting note-taker that talks back.
 
-## What It Does
+OpenGranola sits next to your call, transcribes both sides of the conversation in real time, and searches your own notes to surface things worth saying — right when you need them.
 
-- Captures your microphone and system audio separately during a call
-- Transcribes speech locally on-device with FluidAudio, Parakeet-TDT, and VAD
-- Indexes local `.md` and `.txt` knowledge-base files
-- Retrieves relevant context with Voyage AI embeddings and reranking
-- Generates selective, evidence-backed suggestions with OpenRouter
-- Shows a live transcript and a compact suggestions pane
-- Saves plain-text transcripts and structured session logs locally
-- Hides app windows from screen sharing by default
+Think of it as Granola on steroids: it doesn't just take notes, it reads the room, digs through your knowledge base, and hands you the perfect talking point before the moment passes.
 
-## How It Works
+<p align="center">
+  <img src="assets/screenshot.png" width="360" alt="OpenGranola during an investor call — suggestions drawn from your own notes appear at the top, live transcript below" />
+</p>
 
-OpenGranola is local-first, but not fully offline:
+## How it works
 
-- Transcription runs locally on your Mac
-- Knowledge-base chunks are sent to Voyage AI for embeddings and reranking
-- Recent conversation context and retrieved KB evidence are sent to OpenRouter to generate suggestions
-- API keys are stored in Keychain; other app settings are stored locally in `UserDefaults`
+1. You start a call and hit **Live**
+2. OpenGranola transcribes both speakers locally on your Mac (nothing leaves the device)
+3. When the conversation hits a moment that matters — a question, a decision point, a claim worth backing up — it searches your notes and surfaces relevant talking points
+4. You sound prepared because you are
 
-## Requirements
+Transcription is fully on-device. Your knowledge base is indexed with [Voyage AI](https://www.voyageai.com/) embeddings, and suggestions are generated through [OpenRouter](https://openrouter.ai/) (pick any model you like).
 
-- Apple Silicon Mac
-- macOS 26+
-- Xcode 26 / Swift 6.2 toolchain
-- An OpenRouter API key for suggestions
-- A Voyage AI API key for knowledge-base indexing and retrieval
-
-## Quick Start
-
-1. Build and install the app:
-
-   ```bash
-   ./scripts/build_swift_app.sh
-   ```
-
-2. Launch `/Applications/OpenGranola.app`.
-
-3. Grant permissions when macOS prompts for them:
-   - Microphone access
-   - Screen capture / system audio access
-
-4. Open Settings with `Cmd+,` and configure:
-   - `Voyage AI` API key
-   - `OpenRouter` API key
-   - Model name
-   - Microphone input
-   - Transcription locale
-   - Optional knowledge-base folder
-
-5. Click `Idle` to start a session.
-
-The first live run downloads the local ASR model, which is roughly 600 MB.
-
-## Build
+## Quick start
 
 ```bash
 ./scripts/build_swift_app.sh
 ```
 
-This script:
+This builds and installs the app to `/Applications/OpenGranola.app`.
 
-- builds the Swift package in release mode
-- creates `dist/OpenGranola.app`
-- signs the app if a signing identity is available
-- optionally notarizes it if Apple credentials are present
-- installs the app to `/Applications/OpenGranola.app`
+1. Launch the app and grant microphone + screen capture permissions
+2. Open Settings (`Cmd+,`) and add your Voyage AI and OpenRouter API keys
+3. Point it at a folder of `.md` or `.txt` files — that's your knowledge base
+4. Click **Idle** to go live
 
-Optional environment variables for signing and notarization:
+The first run downloads the local speech model (~600 MB).
 
-- `CODESIGN_IDENTITY`
-- `APPLE_ID`
-- `APPLE_TEAM_ID`
-- `APPLE_APP_PASSWORD`
+## What you need
 
-For a package-only build during development:
+- Apple Silicon Mac, macOS 26+
+- Xcode 26 / Swift 6.2
+- [OpenRouter](https://openrouter.ai/) API key (for suggestions)
+- [Voyage AI](https://www.voyageai.com/) API key (for knowledge base search)
 
-```bash
-cd OpenGranola
-swift build -c debug
-```
+## Knowledge base
 
-## Using the App
+Point the app at a folder of Markdown or plain text files. That's it. OpenGranola chunks, embeds, and caches them locally. When the conversation shifts, it searches your notes and only surfaces what's actually relevant.
 
-- The top bar shows KB indexing status and lets you choose a knowledge-base folder
-- The main pane shows suggestion cards grounded in retrieved KB sources
-- The transcript pane shows both speakers and lets you copy the finalized transcript
-- The bottom control bar starts and stops live capture and shows mic activity
-- Suggestions only appear when the app decides the current moment is worth surfacing and it has strong enough KB evidence
+Works well with meeting prep docs, research notes, pitch decks, competitive analysis, customer briefs — anything you'd want at your fingertips during a call.
 
-## Knowledge Base
+## Privacy
 
-- Point the app at a folder containing `.md` or `.txt` files
-- Files are chunked locally and cached after embedding
-- The app re-indexes when the folder or Voyage API key changes
-- KB cache is stored at `~/Library/Application Support/OpenGranola/kb_cache.json`
+- Speech is transcribed locally — audio never leaves your Mac
+- Knowledge base chunks are sent to Voyage AI for embedding (text only, no audio)
+- Conversation context + relevant notes are sent to OpenRouter to generate suggestions
+- API keys are stored in your Mac's Keychain
+- The app window is hidden from screen sharing by default
+- Transcripts are saved locally to `~/Documents/OpenGranola/`
 
-## Permissions And Local Data
-
-- Microphone permission is required to capture your side of the conversation
-- Screen capture permission is required to capture system audio from the other side of the call
-- Plain-text transcripts are saved to `~/Documents/OpenGranola/`
-- Structured JSONL session logs are saved to `~/Library/Application Support/OpenGranola/sessions/`
-- `Hide from screen sharing` is enabled by default and can be changed in Settings
-
-## Packaging
-
-To build a DMG after building the app:
+## Build
 
 ```bash
+# Full build → sign → install to /Applications
+./scripts/build_swift_app.sh
+
+# Dev build only
+cd OpenGranola && swift build -c debug
+
+# Package DMG
 ./scripts/make_dmg.sh
 ```
 
-The GitHub release workflow uses the same Swift build script and then packages `dist/OpenGranola.dmg`.
+Optional env vars for code signing and notarization: `CODESIGN_IDENTITY`, `APPLE_ID`, `APPLE_TEAM_ID`, `APPLE_APP_PASSWORD`.
 
-## Repo Layout
+## Repo layout
 
-- `OpenGranola/` — SwiftUI app source (Swift Package)
-- `scripts/build_swift_app.sh` — build, sign, and install
-- `scripts/make_dmg.sh` — package DMG for distribution
+```
+OpenGranola/          SwiftUI app (Swift Package)
+scripts/              Build, sign, and package scripts
+assets/               Screenshot and app icon source
+```
+
+## License
+
+MIT
